@@ -1,0 +1,1054 @@
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Doodh Diary</title>
+<meta name="theme-color" content="#0d1b35">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Doodh Diary">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<link id="pwa-manifest" rel="manifest">
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0a0f1e;color:#e8d5b7;font-family:Georgia,serif;-webkit-tap-highlight-color:transparent;overscroll-behavior:none}
+input,select,textarea,button{font-family:Georgia,serif}
+input:focus,select:focus,textarea:focus{outline:none}
+::-webkit-scrollbar{width:3px}
+::-webkit-scrollbar-thumb{background:#1e3a5f;border-radius:2px}
+@keyframes fu{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.fu{animation:fu .22s ease}
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+// ── PWA Manifest ──
+(function(){
+  const m={
+    name:"Doodh Diary",short_name:"Doodh",start_url:"./",
+    display:"standalone",background_color:"#0a0f1e",theme_color:"#0d1b35",
+    description:"Milk Tracker for Dairy",
+    icons:[{src:"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='18' fill='%230d1b35'/%3E%3Ctext y='78' x='8' font-size='82'%3E%F0%9F%A5%9B%3C/text%3E%3C/svg%3E",sizes:"512x512",type:"image/svg+xml"}]
+  };
+  const b=new Blob([JSON.stringify(m)],{type:'application/json'});
+  document.getElementById('pwa-manifest').href=URL.createObjectURL(b);
+})();
+
+// ── Service Worker ──
+if('serviceWorker' in navigator){
+  window.addEventListener('load',()=>{
+    navigator.serviceWorker.register('./sw.js').catch(()=>{});
+  });
+}
+
+// ── Firebase Dynamic Loader ──
+let _fbApp=null;
+function loadFB(cfg,cb){
+  function init(){
+    try{
+      if(_fbApp) try{_fbApp.delete();}catch(e){}
+      _fbApp=firebase.initializeApp(cfg,'doodh-'+Date.now());
+      cb(null,firebase.firestore(_fbApp));
+    }catch(e){cb(e.message);}
+  }
+  if(window.firebase&&firebase.firestore){init();return;}
+  function loadScript(src,next){
+    const s=document.createElement('script');
+    s.src=src;s.onload=next;
+    s.onerror=()=>cb('Firebase load failed. Internet check karo.');
+    document.head.appendChild(s);
+  }
+  loadScript('https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js',()=>{
+    loadScript('https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js',init);
+  });
+}
+</script>
+
+<script type="text/babel">
+const {useState,useEffect,useRef,useCallback}=React;
+
+// ── Storage ──
+const SK='doodh-diary-v2';
+const DEF={dairyName:'Meri Dairy',upiId:'',customers:[],entries:{},payments:{},fbConfig:''};
+const load=()=>{try{const s=localStorage.getItem(SK);return s?{...DEF,...JSON.parse(s)}:DEF;}catch{return DEF;}};
+const persist=(d)=>{try{localStorage.setItem(SK,JSON.stringify(d));}catch{}};
+
+// ── Utils ──
+const p2=n=>String(n).padStart(2,'0');
+const todayStr=()=>{const d=new Date();return `${d.getFullYear()}-${p2(d.getMonth()+1)}-${p2(d.getDate())}`;};
+const getMK=(d=new Date())=>`${d.getFullYear()}-${p2(d.getMonth()+1)}`;
+const DIM=(y,m)=>new Date(y,m,0).getDate();
+const FD=(y,m)=>new Date(y,m-1,1).getDay();
+const MONTHS=['January','February','March','April','May','June','July','August','September','October','November','December'];
+const ML=mk=>{const[y,m]=mk.split('-');return `${MONTHS[+m-1]} ${y}`;};
+const prevMo=mk=>{const[y,m]=mk.split('-').map(Number);return getMK(new Date(y,m-2,1));};
+const nextMo=mk=>{const[y,m]=mk.split('-').map(Number);return getMK(new Date(y,m,1));};
+const fmt=d=>d.split('-').reverse().join('/');
+const uid=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,5);
+const moTotal=(entries,cid,mk)=>{
+  const[y,m]=mk.split('-').map(Number);const d=DIM(y,m);let t=0;
+  for(let i=1;i<=d;i++)t+=entries[`${cid}_${mk}-${p2(i)}`]||0;
+  return Math.round(t*10)/10;
+};
+const paidTotal=(payments,cid,mk)=>(payments[`${cid}_${mk}`]||[]).reduce((s,p)=>s+p.amount,0);
+
+// ── PDF ──
+function makePDF(cust,entries,payments,mk,dairyName,upiId=''){
+  const{jsPDF}=window.jspdf;
+  const doc=new jsPDF({unit:'mm',format:'a4'});
+  const[y,m]=mk.split('-').map(Number);
+  const days=DIM(y,m);
+  const isBuf=cust.milkType==='buffalo';
+
+  // Header
+  doc.setFillColor(13,27,53);doc.rect(0,0,210,38,'F');
+  doc.setTextColor(126,184,247);doc.setFontSize(20);doc.setFont('helvetica','bold');
+  doc.text(dairyName,14,16);
+  doc.setFontSize(10);doc.setTextColor(176,196,222);doc.setFont('helvetica','normal');
+  doc.text(`Monthly Bill — ${ML(mk)}`,14,26);
+  doc.text(`Date: ${fmt(todayStr())}`,14,33);
+
+  // Milk type badge
+  doc.setFillColor(...(isBuf?[74,45,122]:[30,90,60]));
+  doc.roundedRect(148,8,52,14,3,3,'F');
+  doc.setTextColor(255,255,255);doc.setFontSize(10);
+  doc.text(isBuf?'Buffalo Milk':'Cow Milk',152,17);
+
+  // Customer block
+  doc.setFillColor(17,24,39);doc.rect(0,38,210,28,'F');
+  doc.setTextColor(126,184,247);doc.setFontSize(15);doc.setFont('helvetica','bold');
+  doc.text(cust.name,14,52);
+  doc.setTextColor(176,196,222);doc.setFontSize(10);doc.setFont('helvetica','normal');
+  if(cust.phone)doc.text(`Phone: ${cust.phone}`,14,60);
+  doc.text(`Rate: Rs.${cust.rate}/Litre`,130,52);
+  if(cust.phone)doc.text(`WhatsApp: ${cust.phone}`,130,60);
+
+  // Table header
+  let yp=78;
+  doc.setFillColor(20,45,90);doc.rect(10,yp-6,190,8,'F');
+  doc.setTextColor(126,184,247);doc.setFontSize(9);doc.setFont('helvetica','bold');
+  ['Date','Day','Litres','Rate','Amount'].forEach((h,i)=>doc.text(h,[15,48,78,115,148][i],yp));
+  yp+=4;
+
+  const DNS=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  let totL=0,row=0;
+  for(let d=1;d<=days;d++){
+    const ds=`${mk}-${p2(d)}`;
+    const l=entries[`${cust.id}_${ds}`];
+    if(!l)continue;
+    totL+=l;
+    if(row%2===0){doc.setFillColor(14,28,52);doc.rect(10,yp-3,190,7,'F');}
+    doc.setTextColor(200,215,230);doc.setFont('helvetica','normal');doc.setFontSize(9);
+    doc.text(fmt(ds),15,yp);
+    doc.text(DNS[new Date(ds).getDay()],48,yp);
+    doc.text(`${l}L`,78,yp);
+    doc.text(`Rs.${cust.rate}`,115,yp);
+    doc.text(`Rs.${(l*cust.rate).toFixed(0)}`,148,yp);
+    yp+=7;row++;
+    if(yp>262){
+      doc.addPage();
+      doc.setFillColor(13,27,53);doc.rect(0,0,210,14,'F');
+      doc.setTextColor(126,184,247);doc.setFontSize(10);
+      doc.text(`${dairyName} | ${cust.name} (contd.)`,14,10);
+      yp=24;
+    }
+  }
+
+  // Summary
+  yp+=6;
+  const gross=totL*cust.rate;
+  const pmts=(payments[`${cust.id}_${mk}`]||[]);
+  const paid=pmts.reduce((s,p)=>s+p.amount,0);
+  const bal=gross-paid;
+  const boxH=34+(pmts.length>0?(pmts.length*6+18):0);
+  doc.setFillColor(18,38,78);doc.rect(10,yp,190,boxH,'F');
+  yp+=10;
+  doc.setTextColor(126,184,247);doc.setFont('helvetica','bold');doc.setFontSize(11);
+  doc.text(`Total Litres: ${totL}L`,20,yp);
+  doc.text(`Gross: Rs.${gross.toFixed(0)}`,130,yp);
+  yp+=10;
+  if(pmts.length>0){
+    doc.setTextColor(200,215,230);doc.setFont('helvetica','bold');doc.setFontSize(9);
+    doc.text('Payments Received:',20,yp);yp+=7;
+    doc.setFont('helvetica','normal');
+    pmts.forEach(p=>{doc.text(`  ${fmt(p.date)}  Rs.${p.amount}  (${p.note||'Cash'})`,20,yp);yp+=6;});
+    yp+=3;
+    doc.setFont('helvetica','bold');doc.setFontSize(10);
+    doc.setTextColor(37,211,102);
+    doc.text(`Total Paid: Rs.${paid.toFixed(0)}`,20,yp);yp+=10;
+  }
+  doc.setFontSize(13);
+  if(bal<=0){doc.setTextColor(37,211,102);doc.text('PAID IN FULL',20,yp);}
+  else{doc.setTextColor(255,100,100);doc.text(`Balance Due: Rs.${bal.toFixed(0)}`,20,yp);}
+
+  // UPI
+  if(upiId&&bal>0){yp+=10;doc.setFillColor(25,50,30);doc.rect(10,yp-4,190,14,'F');doc.setTextColor(37,211,102);doc.setFontSize(10);doc.setFont('helvetica','bold');doc.text(`UPI Payment: ${upiId}`,20,yp+5);}
+
+  // Footer
+  const fp=doc.internal.pageSize.height-8;
+  doc.setFillColor(13,27,53);doc.rect(0,fp-6,210,14,'F');
+  doc.setTextColor(90,143,196);doc.setFontSize(8);doc.setFont('helvetica','normal');
+  doc.text(`${dairyName} | Doodh Diary App`,14,fp);
+  doc.text(`Generated: ${fmt(todayStr())}`,160,fp);
+  return doc;
+}
+
+// ── WhatsApp Bill Text ──
+function billText(cust,entries,payments,mk,dairyName,upiId=''){
+  const[y,m]=mk.split('-').map(Number);const days=DIM(y,m);
+  const lines=[];let tot=0;
+  for(let d=1;d<=days;d++){
+    const ds=`${mk}-${p2(d)}`;
+    const l=entries[`${cust.id}_${ds}`];
+    if(l){lines.push(`${p2(d)} — ${l}L`);tot+=l;}
+  }
+  const gross=tot*cust.rate;
+  const pmts=(payments[`${cust.id}_${mk}`]||[]);
+  const paid=pmts.reduce((s,p)=>s+p.amount,0);
+  const bal=gross-paid;
+  const mt=cust.milkType==='buffalo'?'🐃 Buffalo':'🐄 Cow';
+  let txt=`🥛 *${dairyName}*\n*Doodh Bill — ${ML(mk)}*\n\n👤 *${cust.name}*\n${mt} Milk | ₹${cust.rate}/L\n\n`;
+  txt+=lines.length?lines.join('\n'):'Koi entry nahi';
+  txt+=`\n\n*Total: ${tot}L × ₹${cust.rate} = ₹${gross.toFixed(0)}*`;
+  if(paid>0) txt+=`\n✅ Paid: ₹${paid.toFixed(0)}`;
+  if(bal>0) txt+=`\n🔴 *Balance Due: ₹${bal.toFixed(0)}*`;
+  else if(paid>0) txt+=`\n✅ *PAID IN FULL*`;
+  if(upiId&&bal>0) txt+=`\n\n💳 *UPI Payment:* \`${upiId}\``;
+  txt+=`\n\n_Dhanyavaad 🙏_`;
+  return txt;
+}
+
+// ── Colors ──
+const C={bg:'#0a0f1e',card:'#0d1b35',border:'#1e3a5f',accent:'#7eb8f7',muted:'#5a8fc4',dim:'#3a6ea8',text:'#e8d5b7',sub:'#b0c4de',dark:'#111827',green:'#25d366',red:'#ff6b6b'};
+const INP=(extra={})=>({padding:'10px 12px',borderRadius:8,border:`1px solid ${C.border}`,background:'#0a0f1e',color:C.text,fontSize:14,width:'100%',boxSizing:'border-box',...extra});
+const CARD=(extra={})=>({background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:'14px 16px',marginBottom:12,...extra});
+const BTN=(primary=false,extra={})=>({padding:'10px 16px',borderRadius:8,border:`1px solid ${primary?'#2a5a9f':C.border}`,background:primary?'#1a3a6e':'transparent',color:primary?C.accent:C.muted,cursor:'pointer',fontSize:14,...extra});
+
+// ── Toast Hook ──
+function useToast(){
+  const[t,setT]=useState({msg:'',type:'ok'});
+  const show=useCallback((msg,type='ok')=>{setT({msg,type});setTimeout(()=>setT({msg:'',type:'ok'}),2600);},[]);
+  return[t,show];
+}
+
+// ══════════════════════════════════════
+// ── DASHBOARD / ENTRY MANAGER ──
+// ══════════════════════════════════════
+function DashboardView({data,saveAll,toast}){
+  const[selCid,setSelCid]=useState('all');
+  const[selMo,setSelMo]=useState(getMK());
+  const mos=[];for(let i=0;i<6;i++){const d=new Date();d.setMonth(d.getMonth()-i);mos.push(getMK(d));}
+  const[y,m]=selMo.split('-').map(Number);
+  const days=DIM(y,m);
+
+  // Build all entries for selected month
+  const rows=[];
+  for(let d=1;d<=days;d++){
+    const ds=`${selMo}-${p2(d)}`;
+    const custList=selCid==='all'?data.customers:data.customers.filter(c=>c.id===selCid);
+    custList.forEach(c=>{
+      const v=data.entries[`${c.id}_${ds}`];
+      if(v) rows.push({cid:c.id,cname:c.name,milkType:c.milkType,rate:c.rate,date:ds,liters:v,amount:v*c.rate});
+    });
+  }
+
+  // Summary per customer
+  const summary=data.customers.map(c=>({
+    ...c,
+    total:moTotal(data.entries,c.id,selMo),
+    paid:paidTotal(data.payments,c.id,selMo),
+  }));
+
+  function deleteEntry(cid,dateStr){
+    const ne={...data.entries};
+    delete ne[`${cid}_${dateStr}`];
+    saveAll({...data,entries:ne});
+    toast('Entry delete ho gayi');
+  }
+
+  function editEntry(cid,dateStr,oldVal){
+    const nv=window.prompt(`${fmt(dateStr)} — naya value (Liters):`,oldVal);
+    if(nv===null)return;
+    const parsed=parseFloat(nv);
+    if(isNaN(parsed)||parsed<0)return toast('Galat value!','err');
+    const ne={...data.entries};
+    if(parsed===0)delete ne[`${cid}_${dateStr}`];
+    else ne[`${cid}_${dateStr}`]=parsed;
+    saveAll({...data,entries:ne});
+    toast('Entry update ho gayi!');
+  }
+
+  const grandTotal=rows.reduce((s,r)=>s+r.liters,0);
+  const grandAmt=rows.reduce((s,r)=>s+r.amount,0);
+
+  return(
+    <div style={{padding:14}}>
+      <div style={{fontSize:16,color:C.accent,marginBottom:14,fontWeight:'bold'}}>📊 Entry Dashboard</div>
+
+      {/* Filters */}
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,marginBottom:14}}>
+        <select value={selMo} onChange={e=>setSelMo(e.target.value)} style={INP()}>
+          {mos.map(mo=><option key={mo} value={mo}>{ML(mo)}</option>)}
+        </select>
+        <select value={selCid} onChange={e=>setSelCid(e.target.value)} style={INP()}>
+          <option value="all">👥 Sab Grahak</option>
+          {data.customers.map(c=><option key={c.id} value={c.id}>{c.milkType==='buffalo'?'🐃':'🐄'} {c.name}</option>)}
+        </select>
+      </div>
+
+      {/* Summary Cards */}
+      <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:8,marginBottom:14}}>
+        <div style={{...CARD({padding:'10px',marginBottom:0}),textAlign:'center'}}>
+          <div style={{fontSize:11,color:C.muted}}>Total Days</div>
+          <div style={{fontSize:18,fontWeight:'bold',color:C.accent}}>{rows.length}</div>
+        </div>
+        <div style={{...CARD({padding:'10px',marginBottom:0}),textAlign:'center'}}>
+          <div style={{fontSize:11,color:C.muted}}>Total Liters</div>
+          <div style={{fontSize:18,fontWeight:'bold',color:C.accent}}>{Math.round(grandTotal*10)/10}L</div>
+        </div>
+        <div style={{...CARD({padding:'10px',marginBottom:0}),textAlign:'center'}}>
+          <div style={{fontSize:11,color:C.muted}}>Total ₹</div>
+          <div style={{fontSize:18,fontWeight:'bold',color:C.accent}}>₹{grandAmt.toFixed(0)}</div>
+        </div>
+      </div>
+
+      {/* Per-Customer summary if all selected */}
+      {selCid==='all'&&data.customers.length>0&&(
+        <div style={{...CARD(),marginBottom:14}}>
+          <div style={{fontSize:12,color:C.dim,marginBottom:8}}>{ML(selMo)} — Grahak Summary</div>
+          {summary.map(c=>{
+            const bal=(c.total*c.rate)-c.paid;
+            return(
+              <div key={c.id} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 0',borderBottom:`1px solid ${C.border}`}}>
+                <div>
+                  <div style={{fontSize:13,color:C.sub}}>{c.milkType==='buffalo'?'🐃':'🐄'} {c.name}</div>
+                  <div style={{fontSize:11,color:C.muted}}>{c.total}L × ₹{c.rate}</div>
+                </div>
+                <div style={{textAlign:'right'}}>
+                  <div style={{fontSize:13,color:C.accent,fontWeight:'bold'}}>₹{(c.total*c.rate).toFixed(0)}</div>
+                  {bal>0&&<div style={{fontSize:10,color:C.red}}>Due ₹{bal.toFixed(0)}</div>}
+                  {bal<=0&&c.paid>0&&<div style={{fontSize:10,color:C.green}}>✓ Clear</div>}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Entry List with Edit/Delete */}
+      <div style={{fontSize:13,color:C.muted,marginBottom:8}}>
+        {rows.length} entries — tap karo edit/delete ke liye
+      </div>
+
+      {rows.length===0&&(
+        <div style={{textAlign:'center',color:C.muted,padding:30,fontSize:13}}>
+          Is mahine koi entry nahi
+        </div>
+      )}
+
+      {rows.map((r,i)=>{
+        const cust=data.customers.find(c=>c.id===r.cid);
+        return(
+          <div key={`${r.cid}_${r.date}`} style={{...CARD({padding:'11px 14px'}),display:'flex',alignItems:'center',gap:10}}>
+            <div style={{flex:1}}>
+              <div style={{display:'flex',alignItems:'center',gap:6,marginBottom:2}}>
+                <span style={{fontSize:14}}>{r.milkType==='buffalo'?'🐃':'🐄'}</span>
+                <span style={{fontSize:14,color:C.sub,fontWeight:'bold'}}>{r.cname}</span>
+              </div>
+              <div style={{fontSize:12,color:C.muted}}>{fmt(r.date)}</div>
+            </div>
+            <div style={{textAlign:'center'}}>
+              <div style={{fontSize:16,fontWeight:'bold',color:C.accent}}>{r.liters}L</div>
+              <div style={{fontSize:11,color:C.muted}}>₹{r.amount.toFixed(0)}</div>
+            </div>
+            <div style={{display:'flex',flexDirection:'column',gap:6}}>
+              <button onClick={()=>editEntry(r.cid,r.date,r.liters)} style={{padding:'6px 12px',borderRadius:7,border:`1px solid ${C.border}`,background:'#1a2a50',color:C.accent,cursor:'pointer',fontSize:12}}>✏️ Edit</button>
+              <button onClick={()=>deleteEntry(r.cid,r.date)} style={{padding:'6px 12px',borderRadius:7,border:'1px solid #4a1525',background:'#2d0f1a',color:C.red,cursor:'pointer',fontSize:12}}>🗑 Del</button>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════
+// ── CALENDAR VIEW ──
+// ══════════════════════════════════════
+function CalendarView({data,saveAll,toast}){
+  const[month,setMonth]=useState(getMK());
+  const[selDay,setSelDay]=useState(null);
+  const[activeCid,setActiveCid]=useState(data.customers[0]?.id||null);
+  const[drop,setDrop]=useState(false);
+  const dropRef=useRef();
+  const td=todayStr();
+
+  useEffect(()=>{
+    if(!activeCid&&data.customers.length>0)setActiveCid(data.customers[0].id);
+  },[data.customers,activeCid]);
+
+  useEffect(()=>{
+    const fn=e=>{if(dropRef.current&&!dropRef.current.contains(e.target))setDrop(false);};
+    document.addEventListener('mousedown',fn);
+    return()=>document.removeEventListener('mousedown',fn);
+  },[]);
+
+  const ac=data.customers.find(c=>c.id===activeCid)||data.customers[0];
+  const[my,mm]=month.split('-').map(Number);
+  const dim=DIM(my,mm);const fd=FD(my,mm);
+
+  function setEntry(cid,ds,val){
+    const v=val===''?undefined:parseFloat(val);
+    const ne={...data.entries};const k=`${cid}_${ds}`;
+    if(v===undefined||isNaN(v))delete ne[k];else ne[k]=v;
+    saveAll({...data,entries:ne});
+  }
+
+  return(
+    <div style={{padding:14}}>
+      {/* Customer Dropdown */}
+      <div ref={dropRef} style={{position:'relative',marginBottom:14}}>
+        <div onClick={()=>data.customers.length>0&&setDrop(o=>!o)}
+          style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'11px 14px',borderRadius:10,border:`1px solid ${drop?C.accent:C.border}`,background:C.card,cursor:'pointer',userSelect:'none'}}>
+          {ac?(
+            <div style={{display:'flex',alignItems:'center',gap:10}}>
+              <span style={{fontSize:22}}>{ac.milkType==='buffalo'?'🐃':'🐄'}</span>
+              <div>
+                <div style={{fontSize:15,color:'#c4d4e8',fontWeight:'bold'}}>{ac.name}</div>
+                {ac.phone&&<div style={{fontSize:11,color:C.muted}}>📞 {ac.phone}</div>}
+              </div>
+            </div>
+          ):<span style={{fontSize:14,color:C.muted}}>Grahak select karo...</span>}
+          <div style={{display:'flex',alignItems:'center',gap:8}}>
+            {ac&&<span style={{fontSize:11,color:C.accent,background:'#1a3a6e',padding:'3px 8px',borderRadius:10}}>₹{ac.rate}/L</span>}
+            <span style={{color:C.muted,fontSize:13}}>{drop?'▲':'▼'}</span>
+          </div>
+        </div>
+        {drop&&(
+          <div style={{position:'absolute',top:'calc(100% + 4px)',left:0,right:0,background:C.card,border:`1px solid #2a5a9f`,borderRadius:10,zIndex:50,overflow:'hidden',boxShadow:'0 8px 24px rgba(0,0,0,0.6)'}}>
+            {data.customers.length===0&&<div style={{padding:14,color:C.muted,fontSize:13,textAlign:'center'}}>Pehle Grahak mein add karo 👥</div>}
+            {data.customers.map((c,i)=>(
+              <div key={c.id} onClick={()=>{setActiveCid(c.id);setDrop(false);setSelDay(null);}}
+                style={{padding:'12px 14px',cursor:'pointer',background:ac?.id===c.id?'#1a3a6e':'transparent',borderTop:i>0?`1px solid ${C.border}`:'none',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                <div style={{display:'flex',alignItems:'center',gap:10}}>
+                  <span style={{fontSize:20}}>{c.milkType==='buffalo'?'🐃':'🐄'}</span>
+                  <div>
+                    <div style={{fontSize:15,color:ac?.id===c.id?C.accent:'#c4d4e8'}}>{c.name}</div>
+                    {c.phone&&<div style={{fontSize:11,color:C.muted}}>📞 {c.phone}</div>}
+                  </div>
+                </div>
+                <div style={{textAlign:'right'}}>
+                  <div style={{fontSize:11,color:C.muted}}>₹{c.rate}/L</div>
+                  <div style={{fontSize:13,color:C.accent,fontWeight:'bold'}}>{moTotal(data.entries,c.id,month)}L</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Month Nav */}
+      <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:12}}>
+        <button onClick={()=>{setMonth(prevMo(month));setSelDay(null);}} style={{padding:'6px 16px',borderRadius:8,border:`1px solid ${C.border}`,background:'transparent',color:C.accent,cursor:'pointer',fontSize:20}}>‹</button>
+        <div style={{fontSize:16,fontWeight:'bold',color:C.accent}}>{ML(month)}</div>
+        <button onClick={()=>{setMonth(nextMo(month));setSelDay(null);}} style={{padding:'6px 16px',borderRadius:8,border:`1px solid ${C.border}`,background:'transparent',color:C.accent,cursor:'pointer',fontSize:20}}>›</button>
+      </div>
+
+      {/* Day Headers */}
+      <div style={{display:'grid',gridTemplateColumns:'repeat(7,1fr)',gap:3,marginBottom:3}}>
+        {['Su','Mo','Tu','We','Th','Fr','Sa'].map(d=><div key={d} style={{textAlign:'center',fontSize:10,color:C.dim,padding:'3px 0'}}>{d}</div>)}
+      </div>
+
+      {/* Calendar Grid */}
+      <div style={{display:'grid',gridTemplateColumns:'repeat(7,1fr)',gap:3}}>
+        {Array(fd).fill(null).map((_,i)=><div key={`b${i}`}/>)}
+        {Array(dim).fill(null).map((_,i)=>{
+          const d=i+1;const ds=`${month}-${p2(d)}`;
+          const isT=ds===td;const isSel=selDay===ds;
+          const entry=ac?(data.entries[`${ac.id}_${ds}`]||0):0;
+          const has=entry>0;
+          return(
+            <div key={d} onClick={()=>{if(!ac)return toast('Pehle grahak add karo!','err');setSelDay(isSel?null:ds);}}
+              style={{borderRadius:9,padding:'7px 2px 5px',textAlign:'center',cursor:'pointer',
+                background:isSel?'#1e4a8e':isT?'#0d2545':has?'#0d1e38':'#111827',
+                border:isSel?`1.5px solid ${C.accent}`:isT?'1.5px solid #3a6ea8':has?`1px solid ${C.border}`:'1px solid #161e2e',
+                transition:'all 0.15s'}}>
+              <div style={{fontSize:13,color:isSel?'#fff':isT?C.accent:C.sub,fontWeight:isT?'bold':'normal'}}>{d}</div>
+              {has?<div style={{fontSize:10,color:'#5ab8f7',marginTop:1,fontWeight:'bold'}}>{entry}L</div>
+                  :<div style={{fontSize:9,color:'#1e3050',marginTop:1}}>·</div>}
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Entry Panel */}
+      {selDay&&(
+        <div className="fu" style={{marginTop:16,...CARD(),border:`1px solid #2a5a9f`}}>
+          <div style={{fontSize:14,color:C.accent,marginBottom:14,fontWeight:'bold'}}>📅 {fmt(selDay)}</div>
+          {data.customers.map(c=>{
+            const val=data.entries[`${c.id}_${selDay}`]||'';
+            return(
+              <div key={c.id} style={{marginBottom:12}}>
+                <div style={{fontSize:12,color:C.muted,marginBottom:5}}>{c.milkType==='buffalo'?'🐃':'🐄'} {c.name} — ₹{c.rate}/L</div>
+                <div style={{display:'flex',gap:6,alignItems:'center'}}>
+                  <input type="number" placeholder="Liters" value={val} onChange={e=>setEntry(c.id,selDay,e.target.value)} style={{...INP(),flex:1,fontSize:15}}/>
+                  {[0.5,1,1.5,2].map(v=>(
+                    <button key={v} onClick={()=>setEntry(c.id,selDay,v)} style={{padding:'9px 8px',borderRadius:7,border:`1px solid #2a5a9f`,background:parseFloat(val)===v?'#1a3a6e':'#111827',color:C.accent,cursor:'pointer',fontSize:12}}>{v}</button>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+          <button onClick={()=>setSelDay(null)} style={{...BTN(),width:'100%',marginTop:4}}>✓ Done</button>
+        </div>
+      )}
+
+      {/* Month Summary */}
+      <div style={{marginTop:14,...CARD()}}>
+        <div style={{fontSize:12,color:C.dim,marginBottom:8}}>{ML(month)} — Kul Hisaab</div>
+        {data.customers.length===0
+          ?<div style={{fontSize:13,color:C.dim,textAlign:'center'}}>Grahak mein naam add karo 👥</div>
+          :data.customers.map(c=>{
+            const t=moTotal(data.entries,c.id,month);
+            const paid=paidTotal(data.payments,c.id,month);
+            const bal=(t*c.rate)-paid;
+            return(
+              <div key={c.id} style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8,paddingBottom:8,borderBottom:`1px solid ${C.border}`}}>
+                <div>
+                  <div style={{fontSize:14,color:C.sub}}>{c.milkType==='buffalo'?'🐃':'🐄'} {c.name}</div>
+                  <div style={{fontSize:11,color:C.muted}}>{t}L × ₹{c.rate}</div>
+                </div>
+                <div style={{textAlign:'right'}}>
+                  <div style={{fontSize:14,color:C.accent,fontWeight:'bold'}}>₹{(t*c.rate).toFixed(0)}</div>
+                  {bal>0&&<div style={{fontSize:11,color:C.red}}>Due: ₹{bal.toFixed(0)}</div>}
+                  {bal<=0&&paid>0&&<div style={{fontSize:11,color:C.green}}>✓ Paid</div>}
+                </div>
+              </div>
+            );
+          })
+        }
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════
+// ── CUSTOMERS VIEW ──
+// ══════════════════════════════════════
+function CustomersView({data,saveAll,toast}){
+  const[name,setName]=useState('');
+  const[phone,setPhone]=useState('');
+  const[rate,setRate]=useState('');
+  const[milkType,setMilkType]=useState('cow');
+  const[editId,setEditId]=useState(null);
+
+  function add(){
+    const n=name.trim();if(!n)return;
+    if(data.customers.find(c=>c.name.toLowerCase()===n.toLowerCase()))return toast('Naam pehle se hai!','err');
+    const id=uid();
+    saveAll({...data,customers:[...data.customers,{id,name:n,phone:phone.trim(),rate:parseFloat(rate)||60,milkType}]});
+    setName('');setPhone('');setRate('');setMilkType('cow');
+    toast(`${n} add ho gaya!`);
+  }
+
+  function update(id,field,val){
+    saveAll({...data,customers:data.customers.map(c=>c.id===id?{...c,[field]:field==='rate'?parseFloat(val)||c.rate:val}:c)});
+  }
+
+  function remove(id){
+    saveAll({...data,customers:data.customers.filter(c=>c.id!==id)});
+    toast('Remove ho gaya');
+  }
+
+  const MilkBtn=({type,current,onChange})=>(
+    <button onClick={()=>onChange(type)} style={{flex:1,padding:'9px 6px',borderRadius:8,border:`1px solid ${current===type?'#2a5a9f':C.border}`,background:current===type?(type==='buffalo'?'#3a1a6e':'#1a3a6e'):'transparent',color:current===type?C.accent:C.muted,cursor:'pointer',fontSize:13,display:'flex',alignItems:'center',justifyContent:'center',gap:5}}>
+      <span>{type==='buffalo'?'🐃':'🐄'}</span> {type==='buffalo'?'Buffalo':'Cow'}
+    </button>
+  );
+
+  return(
+    <div style={{padding:16}}>
+      <div style={{fontSize:16,color:C.accent,marginBottom:16,fontWeight:'bold'}}>👥 Grahak List</div>
+
+      {/* Add Form */}
+      <div style={CARD()}>
+        <div style={{fontSize:13,color:C.muted,marginBottom:10}}>Naya Grahak Add Karo</div>
+        <input placeholder="Naam *" value={name} onChange={e=>setName(e.target.value)} onKeyDown={e=>e.key==='Enter'&&add()} style={{...INP(),marginBottom:8}}/>
+        <input placeholder="Phone number (WhatsApp ke liye)" value={phone} onChange={e=>setPhone(e.target.value)} type="tel" style={{...INP(),marginBottom:8}}/>
+        <div style={{display:'flex',gap:6,marginBottom:8}}>
+          <MilkBtn type="cow" current={milkType} onChange={setMilkType}/>
+          <MilkBtn type="buffalo" current={milkType} onChange={setMilkType}/>
+        </div>
+        <div style={{display:'flex',gap:8}}>
+          <input placeholder="Rate ₹/L (default 60)" value={rate} onChange={e=>setRate(e.target.value)} type="number" style={{...INP(),flex:1}}/>
+          <button onClick={add} style={{...BTN(true),padding:'10px 20px',whiteSpace:'nowrap'}}>+ Add</button>
+        </div>
+      </div>
+
+      {/* List */}
+      {data.customers.map(c=>(
+        <div key={c.id} style={CARD()}>
+          {editId===c.id?(
+            <div>
+              <input defaultValue={c.name} onBlur={e=>update(c.id,'name',e.target.value)} style={{...INP(),marginBottom:8,fontSize:15,fontWeight:'bold'}}/>
+              <input defaultValue={c.phone} placeholder="Phone" onBlur={e=>update(c.id,'phone',e.target.value)} type="tel" style={{...INP(),marginBottom:8}}/>
+              <div style={{display:'flex',gap:6,marginBottom:8}}>
+                <MilkBtn type="cow" current={c.milkType} onChange={v=>update(c.id,'milkType',v)}/>
+                <MilkBtn type="buffalo" current={c.milkType} onChange={v=>update(c.id,'milkType',v)}/>
+              </div>
+              <div style={{display:'flex',gap:8,alignItems:'center'}}>
+                <span style={{fontSize:12,color:C.muted}}>Rate ₹/L:</span>
+                <input defaultValue={c.rate} type="number" onBlur={e=>update(c.id,'rate',e.target.value)} style={{...INP(),flex:1}}/>
+                <button onClick={()=>setEditId(null)} style={{...BTN(true),padding:'10px 16px'}}>✓ Done</button>
+              </div>
+            </div>
+          ):(
+            <div style={{display:'flex',alignItems:'center',gap:10}}>
+              <span style={{fontSize:28}}>{c.milkType==='buffalo'?'🐃':'🐄'}</span>
+              <div style={{flex:1}}>
+                <div style={{fontSize:16,color:'#c4d4e8',fontWeight:'bold'}}>{c.name}</div>
+                {c.phone&&<div style={{fontSize:12,color:C.muted}}>📞 {c.phone}</div>}
+                <div style={{fontSize:12,color:C.muted}}>{c.milkType==='buffalo'?'Buffalo':'Cow'} Milk · ₹{c.rate}/L</div>
+              </div>
+              <div style={{textAlign:'right',display:'flex',flexDirection:'column',gap:6}}>
+                <div style={{fontSize:13,color:C.accent,fontWeight:'bold'}}>{moTotal(data.entries,c.id,getMK())}L</div>
+                <div style={{display:'flex',gap:6}}>
+                  <button onClick={()=>setEditId(c.id)} style={{padding:'5px 10px',borderRadius:6,border:`1px solid ${C.border}`,background:'transparent',color:C.muted,cursor:'pointer',fontSize:13}}>✏️</button>
+                  <button onClick={()=>remove(c.id)} style={{padding:'5px 10px',borderRadius:6,border:'1px solid #4a1525',background:'#2d0f1a',color:C.red,cursor:'pointer',fontSize:13}}>🗑</button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════
+// ── BILL VIEW ──
+// ══════════════════════════════════════
+function BillView({data,saveAll,toast}){
+  const[bMo,setBMo]=useState(getMK());
+  const[loading,setLoading]=useState({});
+  const mos=[];
+  for(let i=0;i<6;i++){const d=new Date();d.setMonth(d.getMonth()-i);mos.push(getMK(d));}
+
+  function sendWA(c){
+    const txt=encodeURIComponent(billText(c,data.entries,data.payments,bMo,data.dairyName,data.upiId||''));
+    const ph=c.phone?c.phone.replace(/\D/g,''):'';
+    window.open(ph?`https://wa.me/91${ph}?text=${txt}`:`https://wa.me/?text=${txt}`,'_blank');
+  }
+
+  function downloadPDF(c){
+    setLoading(l=>({...l,[c.id]:true}));
+    try{
+      const doc=makePDF(c,data.entries,data.payments,bMo,data.dairyName,data.upiId||'');
+      doc.save(`${c.name}-${bMo}-bill.pdf`);
+      toast('PDF download ho gaya!');
+    }catch(e){toast('PDF error: '+e.message,'err');}
+    setLoading(l=>({...l,[c.id]:false}));
+  }
+
+  return(
+    <div style={{padding:16}}>
+      <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:16}}>
+        <div style={{fontSize:16,color:C.accent,fontWeight:'bold'}}>💰 Mahine ka Bill</div>
+        <select value={bMo} onChange={e=>setBMo(e.target.value)} style={{...INP(),width:'auto',flex:1}}>
+          {mos.map(m=><option key={m} value={m}>{ML(m)}</option>)}
+        </select>
+      </div>
+
+      {data.customers.length===0
+        ?<div style={{textAlign:'center',color:C.muted,padding:40}}>Koi grahak nahi hai</div>
+        :data.customers.map(c=>{
+          const tot=moTotal(data.entries,c.id,bMo);
+          const gross=tot*c.rate;
+          const paid=paidTotal(data.payments,c.id,bMo);
+          const bal=gross-paid;
+          return(
+            <div key={c.id} style={CARD()}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:10}}>
+                <div>
+                  <div style={{fontSize:17,fontWeight:'bold',color:'#c4d4e8',display:'flex',alignItems:'center',gap:6}}>
+                    <span>{c.milkType==='buffalo'?'🐃':'🐄'}</span>{c.name}
+                  </div>
+                  {c.phone&&<div style={{fontSize:12,color:C.muted}}>📞 {c.phone}</div>}
+                  <div style={{fontSize:12,color:C.muted,marginTop:3}}>₹{c.rate}/L · {tot}L · Gross: ₹{gross.toFixed(0)}</div>
+                </div>
+                <div style={{textAlign:'right'}}>
+                  <div style={{fontSize:21,fontWeight:'bold',color:bal>0?C.red:C.green}}>₹{bal>0?bal.toFixed(0):0}</div>
+                  <div style={{fontSize:11,color:C.muted}}>{bal>0?'Due':'Clear'}</div>
+                  {paid>0&&<div style={{fontSize:11,color:C.green}}>Paid: ₹{paid.toFixed(0)}</div>}
+                </div>
+              </div>
+              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
+                <button onClick={()=>downloadPDF(c)} style={{padding:'11px',borderRadius:10,background:'#1a2a50',border:`1px solid #2a5a9f`,color:C.accent,cursor:'pointer',fontWeight:'bold',fontSize:14,display:'flex',alignItems:'center',justifyContent:'center',gap:6}}>
+                  {loading[c.id]?'⏳':'📄'} PDF
+                </button>
+                <button onClick={()=>sendWA(c)} style={{padding:'11px',borderRadius:10,background:'linear-gradient(135deg,#128c7e,#25d366)',border:'none',color:'#fff',cursor:'pointer',fontWeight:'bold',fontSize:14,display:'flex',alignItems:'center',justifyContent:'center',gap:6}}>
+                  📱 WhatsApp
+                </button>
+              </div>
+            </div>
+          );
+        })
+      }
+    </div>
+  );
+}
+
+// ══════════════════════════════════════
+// ── PAYMENTS VIEW ──
+// ══════════════════════════════════════
+function PaymentsView({data,saveAll,toast}){
+  const[selCid,setSelCid]=useState(data.customers[0]?.id||null);
+  const[pMo,setPMo]=useState(getMK());
+  const[amount,setAmount]=useState('');
+  const[note,setNote]=useState('Cash');
+  const[pDate,setPDate]=useState(todayStr());
+  const mos=[];for(let i=0;i<6;i++){const d=new Date();d.setMonth(d.getMonth()-i);mos.push(getMK(d));}
+  const sc=data.customers.find(c=>c.id===selCid)||data.customers[0];
+  const pmtKey=sc?`${sc.id}_${pMo}`:'';
+  const pmts=data.payments[pmtKey]||[];
+  const tot=moTotal(data.entries,sc?.id,pMo);
+  const gross=sc?tot*sc.rate:0;
+  const paid=pmts.reduce((s,p)=>s+p.amount,0);
+  const bal=gross-paid;
+
+  function addPayment(){
+    const amt=parseFloat(amount);
+    if(!amt||!sc)return toast('Amount likhо','err');
+    const k=`${sc.id}_${pMo}`;
+    const existing=data.payments[k]||[];
+    const np={id:uid(),date:pDate,amount:amt,note:note.trim()||'Cash'};
+    saveAll({...data,payments:{...data.payments,[k]:[...existing,np]}});
+    setAmount('');toast(`₹${amt} add ho gaya!`);
+  }
+
+  function removePayment(pid){
+    const k=pmtKey;
+    saveAll({...data,payments:{...data.payments,[k]:(data.payments[k]||[]).filter(p=>p.id!==pid)}});
+    toast('Payment remove ho gaya');
+  }
+
+  return(
+    <div style={{padding:16}}>
+      <div style={{fontSize:16,color:C.accent,marginBottom:16,fontWeight:'bold'}}>💳 Payment Tracking</div>
+
+      {/* Customer + Month */}
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,marginBottom:14}}>
+        <select value={selCid||''} onChange={e=>setSelCid(e.target.value)} style={INP()}>
+          {data.customers.map(c=><option key={c.id} value={c.id}>{c.milkType==='buffalo'?'🐃':'🐄'} {c.name}</option>)}
+        </select>
+        <select value={pMo} onChange={e=>setPMo(e.target.value)} style={INP()}>
+          {mos.map(m=><option key={m} value={m}>{ML(m)}</option>)}
+        </select>
+      </div>
+
+      {/* Summary Card */}
+      {sc&&(
+        <div style={{...CARD(),background:'#0d1e38',borderColor:'#2a5a9f'}}>
+          <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:8,textAlign:'center'}}>
+            <div>
+              <div style={{fontSize:11,color:C.muted,marginBottom:3}}>Kul Bill</div>
+              <div style={{fontSize:18,fontWeight:'bold',color:C.accent}}>₹{gross.toFixed(0)}</div>
+              <div style={{fontSize:10,color:C.muted}}>{tot}L × ₹{sc.rate}</div>
+            </div>
+            <div>
+              <div style={{fontSize:11,color:C.muted,marginBottom:3}}>Paid</div>
+              <div style={{fontSize:18,fontWeight:'bold',color:C.green}}>₹{paid.toFixed(0)}</div>
+            </div>
+            <div>
+              <div style={{fontSize:11,color:C.muted,marginBottom:3}}>Balance</div>
+              <div style={{fontSize:18,fontWeight:'bold',color:bal>0?C.red:C.green}}>
+                {bal>0?`₹${bal.toFixed(0)}`:'Clear ✓'}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Add Payment */}
+      {sc&&(
+        <div style={CARD()}>
+          <div style={{fontSize:13,color:C.muted,marginBottom:10}}>Payment Add Karo</div>
+          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,marginBottom:8}}>
+            <input type="number" placeholder="Amount ₹" value={amount} onChange={e=>setAmount(e.target.value)} style={INP()}/>
+            <input type="date" value={pDate} onChange={e=>setPDate(e.target.value)} style={INP()}/>
+          </div>
+          <div style={{display:'flex',gap:6,marginBottom:8}}>
+            {['Cash','UPI','Cheque','Online'].map(n=>(
+              <button key={n} onClick={()=>setNote(n)} style={{flex:1,padding:'7px 4px',borderRadius:7,border:`1px solid ${note===n?'#2a5a9f':C.border}`,background:note===n?'#1a3a6e':'transparent',color:note===n?C.accent:C.muted,cursor:'pointer',fontSize:12}}>
+                {n}
+              </button>
+            ))}
+          </div>
+          <button onClick={addPayment} style={{...BTN(true),width:'100%',textAlign:'center'}}>+ Payment Add Karo</button>
+        </div>
+      )}
+
+      {/* Payment History */}
+      {pmts.length>0&&(
+        <div style={CARD()}>
+          <div style={{fontSize:13,color:C.muted,marginBottom:10}}>Payment History — {ML(pMo)}</div>
+          {[...pmts].reverse().map(p=>(
+            <div key={p.id} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'10px 0',borderBottom:`1px solid ${C.border}`}}>
+              <div>
+                <div style={{fontSize:14,color:C.sub}}>{fmt(p.date)}</div>
+                <div style={{fontSize:11,color:C.muted}}>{p.note}</div>
+              </div>
+              <div style={{display:'flex',alignItems:'center',gap:10}}>
+                <div style={{fontSize:16,fontWeight:'bold',color:C.green}}>₹{p.amount}</div>
+                <button onClick={()=>removePayment(p.id)} style={{padding:'4px 8px',borderRadius:5,border:'1px solid #4a1525',background:'#2d0f1a',color:C.red,cursor:'pointer',fontSize:12}}>✕</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      {sc&&pmts.length===0&&<div style={{textAlign:'center',color:C.muted,padding:20,fontSize:13}}>Is mahine koi payment nahi hai</div>}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════
+// ── SETTINGS VIEW ──
+// ══════════════════════════════════════
+function SettingsView({data,saveAll,toast}){
+  const[dName,setDName]=useState(data.dairyName);
+  const[upi,setUpi]=useState(data.upiId||'');
+  const[backupCode,setBackupCode]=useState('');
+  const[restoreIn,setRestoreIn]=useState('');
+  const[fbCfg,setFbCfg]=useState(data.fbConfig||'');
+  const[fbStatus,setFbStatus]=useState('');
+  const[fbLoading,setFbLoading]=useState(false);
+  const[showRestore,setShowRestore]=useState(false);
+
+  function saveDairyName(){
+    saveAll({...data,dairyName:dName.trim()||'Meri Dairy',upiId:upi.trim()});
+    toast('Settings save ho gaye!');
+  }
+
+  function genBackup(){
+    const code=btoa(unescape(encodeURIComponent(JSON.stringify(data))));
+    setBackupCode(code);toast('Backup ready!');
+  }
+
+  function copyCode(){
+    navigator.clipboard.writeText(backupCode).then(()=>toast('Copy ho gaya!')).catch(()=>toast('Manual copy karo','err'));
+  }
+
+  function restore(){
+    try{
+      const d=JSON.parse(decodeURIComponent(escape(atob(restoreIn.trim()))));
+      if(!d.customers)throw new Error();
+      saveAll({...DEF,...d});
+      setRestoreIn('');setShowRestore(false);
+      toast('Restore ho gaya!');
+    }catch{toast('Invalid backup code!','err');}
+  }
+
+  function saveFbConfig(){
+    try{
+      if(fbCfg.trim()){JSON.parse(fbCfg);}
+      saveAll({...data,fbConfig:fbCfg.trim()});
+      toast('Firebase config save ho gaya!');
+    }catch{toast('Invalid JSON config!','err');}
+  }
+
+  async function backupToFB(){
+    if(!data.fbConfig)return toast('Pehle Firebase config add karo','err');
+    setFbLoading(true);setFbStatus('');
+    try{
+      const cfg=JSON.parse(data.fbConfig);
+      loadFB(cfg,(err,db)=>{
+        if(err){setFbStatus('Error: '+err);setFbLoading(false);return;}
+        db.collection('doodh-diary').doc('backup').set({
+          data:JSON.stringify(data),
+          ts:Date.now(),
+          dairy:data.dairyName
+        }).then(()=>{
+          setFbStatus('✅ Backup successful!');setFbLoading(false);toast('Firebase backup ho gaya!');
+        }).catch(e=>{setFbStatus('Error: '+e.message);setFbLoading(false);});
+      });
+    }catch(e){setFbStatus('Config error: '+e.message);setFbLoading(false);}
+  }
+
+  async function restoreFromFB(){
+    if(!data.fbConfig)return toast('Pehle Firebase config add karo','err');
+    setFbLoading(true);setFbStatus('');
+    try{
+      const cfg=JSON.parse(data.fbConfig);
+      loadFB(cfg,(err,db)=>{
+        if(err){setFbStatus('Error: '+err);setFbLoading(false);return;}
+        db.collection('doodh-diary').doc('backup').get().then(doc=>{
+          if(!doc.exists){setFbStatus('Koi backup nahi mila');setFbLoading(false);return;}
+          const restored=JSON.parse(doc.data().data);
+          saveAll({...DEF,...restored});
+          setFbStatus('✅ Restore successful!');setFbLoading(false);
+          toast('Firebase se restore ho gaya!');
+        }).catch(e=>{setFbStatus('Error: '+e.message);setFbLoading(false);});
+      });
+    }catch(e){setFbStatus('Config error: '+e.message);setFbLoading(false);}
+  }
+
+  const tot=data.customers.reduce((s,c)=>s+moTotal(data.entries,c.id,getMK())*c.rate,0);
+
+  return(
+    <div style={{padding:16}}>
+      <div style={{fontSize:16,color:C.accent,marginBottom:16,fontWeight:'bold'}}>⚙️ Settings</div>
+
+      {/* Dairy Name + UPI */}
+      <div style={CARD()}>
+        <div style={{fontSize:14,color:'#c4d4e8',marginBottom:10,fontWeight:'bold'}}>🏪 Dairy Settings</div>
+        <div style={{fontSize:12,color:C.muted,marginBottom:5}}>Dairy ka naam</div>
+        <input value={dName} onChange={e=>setDName(e.target.value)} placeholder="Dairy ka naam" style={{...INP(),marginBottom:10}}/>
+        <div style={{fontSize:12,color:C.muted,marginBottom:5}}>UPI ID (bill pe dikhega)</div>
+        <input value={upi} onChange={e=>setUpi(e.target.value)} placeholder="yourname@upi" style={{...INP(),marginBottom:10}}/>
+        {upi&&<div style={{fontSize:12,color:C.green,marginBottom:8}}>✓ Bill + PDF mein UPI dikhega jab balance ho</div>}
+        <button onClick={saveDairyName} style={{...BTN(true),width:'100%',textAlign:'center'}}>✓ Save Settings</button>
+      </div>
+
+      {/* Local Backup */}
+      <div style={CARD()}>
+        <div style={{fontSize:14,color:'#c4d4e8',marginBottom:4,fontWeight:'bold'}}>📦 Local Backup</div>
+        <div style={{fontSize:12,color:C.muted,marginBottom:10}}>Code copy karo → safe jagah save karo (WA pe khud bhejo)</div>
+        <button onClick={genBackup} style={{...BTN(true),width:'100%',textAlign:'center',marginBottom:backupCode?8:0}}>🔒 Backup Code Banao</button>
+        {backupCode&&<>
+          <textarea readOnly value={backupCode} style={{...INP(),height:70,fontSize:10,wordBreak:'break-all',resize:'none',marginBottom:8}}/>
+          <button onClick={copyCode} style={{...BTN(),width:'100%',textAlign:'center'}}>📋 Code Copy Karo</button>
+        </>}
+      </div>
+
+      {/* Local Restore */}
+      <div style={CARD()}>
+        <div style={{fontSize:14,color:'#c4d4e8',marginBottom:4,fontWeight:'bold'}}>♻️ Local Restore</div>
+        {!showRestore
+          ?<button onClick={()=>setShowRestore(true)} style={{...BTN(),width:'100%',textAlign:'center'}}>📥 Restore Karo</button>
+          :<><textarea placeholder="Backup code paste karo..." value={restoreIn} onChange={e=>setRestoreIn(e.target.value)} style={{...INP(),height:70,fontSize:10,resize:'none',marginBottom:8}}/>
+            <div style={{display:'flex',gap:8}}>
+              <button onClick={restore} style={{...BTN(true),flex:1,textAlign:'center'}}>✓ Restore</button>
+              <button onClick={()=>{setShowRestore(false);setRestoreIn('');}} style={{...BTN(),flex:1,textAlign:'center'}}>✕ Cancel</button>
+            </div>
+          </>
+        }
+      </div>
+
+      {/* Firebase Backup */}
+      <div style={CARD()}>
+        <div style={{fontSize:14,color:'#c4d4e8',marginBottom:4,fontWeight:'bold'}}>🔥 Firebase Backup (Online)</div>
+        <div style={{fontSize:12,color:C.muted,marginBottom:10}}>Apna Firebase config JSON paste karo. Firebase Console → Project Settings → Web App Config</div>
+        <textarea value={fbCfg} onChange={e=>setFbCfg(e.target.value)} placeholder={'{\n  "apiKey": "...",\n  "authDomain": "...",\n  "projectId": "..."\n}'} style={{...INP(),height:100,fontSize:11,resize:'none',marginBottom:8}}/>
+        <button onClick={saveFbConfig} style={{...BTN(),width:'100%',textAlign:'center',marginBottom:8}}>💾 Config Save Karo</button>
+        {data.fbConfig&&<div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
+          <button onClick={backupToFB} disabled={fbLoading} style={{...BTN(true),textAlign:'center'}}>
+            {fbLoading?'⏳ Wait...':'☁️ Backup to Firebase'}
+          </button>
+          <button onClick={restoreFromFB} disabled={fbLoading} style={{...BTN(),textAlign:'center'}}>
+            {fbLoading?'⏳ Wait...':'📥 Restore from Firebase'}
+          </button>
+        </div>}
+        {fbStatus&&<div style={{marginTop:8,fontSize:12,color:fbStatus.startsWith('✅')?C.green:C.red,textAlign:'center'}}>{fbStatus}</div>}
+      </div>
+
+      {/* App Stats */}
+      <div style={CARD()}>
+        <div style={{fontSize:14,color:'#c4d4e8',marginBottom:10,fontWeight:'bold'}}>📊 App Info</div>
+        {[
+          ['Total Grahak',data.customers.length],
+          ['Total Entries',Object.keys(data.entries).length],
+          ['Is Mahine ka Total',`₹${tot.toFixed(0)}`],
+        ].map(([k,v])=>(
+          <div key={k} style={{display:'flex',justifyContent:'space-between',marginBottom:6}}>
+            <span style={{fontSize:13,color:C.muted}}>{k}</span>
+            <span style={{fontSize:13,color:C.accent,fontWeight:'bold'}}>{v}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════
+// ── MAIN APP ──
+// ══════════════════════════════════════
+function App(){
+  const[data,setData]=useState(DEF);
+  const[view,setView]=useState('calendar');
+  const[loading,setLoading]=useState(true);
+  const[toast,showToast]=useToast();
+
+  useEffect(()=>{setData(load());setLoading(false);},[]);
+
+  function saveAll(nd){setData(nd);persist(nd);}
+
+  if(loading)return(
+    <div style={{display:'flex',alignItems:'center',justifyContent:'center',height:'100vh',background:C.bg,color:C.accent,fontSize:18}}>
+      🥛 Loading...
+    </div>
+  );
+
+  const tabs=[
+    {key:'calendar',icon:'📅',label:'Cal'},
+    {key:'dashboard',icon:'📊',label:'Dashboard'},
+    {key:'customers',icon:'👥',label:'Grahak'},
+    {key:'bill',icon:'💰',label:'Bill'},
+    {key:'payments',icon:'💳',label:'Pay'},
+    {key:'settings',icon:'⚙️',label:'Settings'},
+  ];
+
+  return(
+    <div style={{minHeight:'100vh',background:C.bg,paddingBottom:68}}>
+      {/* Header */}
+      <div style={{background:'linear-gradient(135deg,#0d1b35,#0a0f1e)',padding:'13px 16px 11px',borderBottom:`1px solid ${C.border}`,display:'flex',alignItems:'center',gap:12,position:'sticky',top:0,zIndex:20}}>
+        <span style={{fontSize:24}}>🥛</span>
+        <div>
+          <div style={{fontSize:18,fontWeight:'bold',color:C.accent,letterSpacing:0.8}}>{data.dairyName}</div>
+          <div style={{fontSize:10,color:C.muted}}>Doodh Diary</div>
+        </div>
+        <div style={{marginLeft:'auto',fontSize:11,color:C.muted,textAlign:'right'}}>
+          {fmt(todayStr())}<br/><span style={{color:C.accent}}>{data.customers.length} Grahak</span>
+        </div>
+      </div>
+
+      {/* Toast */}
+      {toast.msg&&(
+        <div style={{position:'fixed',top:14,left:'50%',transform:'translateX(-50%)',background:toast.type==='err'?'#3d1520':'#1a3a6e',color:toast.type==='err'?C.red:C.accent,padding:'10px 22px',borderRadius:10,zIndex:200,fontSize:13,boxShadow:'0 4px 20px rgba(0,0,0,0.5)',border:`1px solid ${toast.type==='err'?'#6b2737':'#2a5a9f'}`,whiteSpace:'nowrap',maxWidth:'90vw'}}>
+          {toast.msg}
+        </div>
+      )}
+
+      {/* Content */}
+      <div style={{overflowY:'auto',minHeight:'calc(100vh - 120px)'}}>
+        {view==='calendar'&&<CalendarView data={data} saveAll={saveAll} toast={showToast}/>}
+        {view==='dashboard'&&<DashboardView data={data} saveAll={saveAll} toast={showToast}/>}
+        {view==='customers'&&<CustomersView data={data} saveAll={saveAll} toast={showToast}/>}
+        {view==='bill'&&<BillView data={data} saveAll={saveAll} toast={showToast}/>}
+        {view==='payments'&&<PaymentsView data={data} saveAll={saveAll} toast={showToast}/>}
+        {view==='settings'&&<SettingsView data={data} saveAll={saveAll} toast={showToast}/>}
+      </div>
+
+      {/* Bottom Nav */}
+      <div style={{position:'fixed',bottom:0,left:0,right:0,background:'#0d1b35',borderTop:`1px solid ${C.border}`,display:'flex',zIndex:20,paddingBottom:'env(safe-area-inset-bottom)'}}>
+        {tabs.map(t=>(
+          <button key={t.key} onClick={()=>setView(t.key)} style={{flex:1,padding:'8px 2px 6px',border:'none',cursor:'pointer',background:view===t.key?'#1a3a6e':'transparent',borderTop:view===t.key?`2px solid ${C.accent}`:'2px solid transparent',transition:'all 0.15s',display:'flex',flexDirection:'column',alignItems:'center',gap:2}}>
+            <span style={{fontSize:19}}>{t.icon}</span>
+            <span style={{fontSize:9,color:view===t.key?C.accent:C.dim}}>{t.label}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
